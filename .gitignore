@@ -1,0 +1,32 @@
+# 编译产物
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+*.test
+/tmp/
+
+# Go 工具链
+vendor/
+go.work
+go.work.sum
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 项目本地配置
+*.local.json
+
+# 测试数据（大文件，不纳入版本控制）
+testdata.jsonl
