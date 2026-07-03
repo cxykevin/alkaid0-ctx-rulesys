@@ -152,10 +152,17 @@ func scoreCodeLine(line string) int {
 	}
 
 	if codeKeywords[firstUpper] {
-		tospace := strings.Index(firstWord, " ")
-		toparen := strings.Index(firstWord, "(")
 		if firstUpper == "FUNC" || firstUpper == "FUNCTION" || firstUpper == "DEF" || firstUpper == "FN" {
-			if tospace >= 0 || toparen >= 0 || trimmed == "fn" {
+			// 函数定义关键字需要后面跟空格或括号
+			after := strings.TrimPrefix(trimmed, firstWord)
+			if strings.HasPrefix(after, " ") || strings.HasPrefix(after, "(") || trimmed == "fn" {
+				score += 20
+			}
+		} else if firstUpper == "THIS" {
+			// "THIS" 是 JS/TS 代码关键词，但 "This" 在句首是自然语言
+			// 仅当后面跟 . (this.property) 或 ( (This(...)) 时算代码
+			after := strings.TrimPrefix(trimmed, firstWord)
+			if strings.HasPrefix(after, ".") || strings.HasPrefix(after, "(") {
 				score += 20
 			}
 		} else {

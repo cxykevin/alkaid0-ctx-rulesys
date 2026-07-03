@@ -213,6 +213,9 @@ func (e *Engine) processLines(lines []string) []Segment {
 	// 清理：去除每段首尾的空白/换行
 	trimSegments(segments)
 
+	// 行内分割后处理：识别同一行内 prompt→code/log 的转换边界
+	segments = splitIntraLine(segments, e.transitionThreshold)
+
 	return segments
 }
 

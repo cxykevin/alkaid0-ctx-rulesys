@@ -8,6 +8,7 @@
 *.out
 *.test
 /tmp/
+/eval
 
 # Go 工具链
 vendor/
