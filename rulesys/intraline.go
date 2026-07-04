@@ -274,6 +274,11 @@ func detectColonBoundary(line string, segType SegmentType, threshold int) []segm
 			continue
 		}
 
+		// 冒号后紧跟引号的是代码字面量（如 line:"2025/12/07"），跳过
+		if len(suffix) > 0 && (suffix[0] == '"' || suffix[0] == '\'') {
+			continue
+		}
+
 		// 前缀验证：前缀不应该像代码或日志
 		prefixCL := classifyLine(prefix)
 		if prefixCL.codeScore >= threshold || prefixCL.logScore >= threshold {
