@@ -348,6 +348,17 @@ func scoreCodeLine(line string) int {
 		score += 12
 	}
 
+	// 行尾中文惩罚：如果代码部分（不含注释）以中文结尾，可能是混合内容
+	if !isComment {
+		codePartTrimmed := strings.TrimSpace(codePart)
+		if containsChinese(codePartTrimmed) {
+			lastRune, _ := utf8.DecodeLastRuneInString(codePartTrimmed)
+			if unicode.Is(unicode.Han, lastRune) {
+				score -= 10
+			}
+		}
+	}
+
 	return score
 }
 
