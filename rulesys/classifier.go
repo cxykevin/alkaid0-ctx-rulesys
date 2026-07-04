@@ -299,6 +299,25 @@ func scoreCodeLine(line string) int {
 			score += 12
 		}
 	}
+	// 结构体字段/变量声明（identifier type 模式，如 logScore int）
+	if !containsChinese(codePart) {
+		fieldWords := strings.Fields(codePart)
+		if len(fieldWords) == 2 {
+			typeKW := map[string]bool{
+				"int": true, "int8": true, "int16": true, "int32": true, "int64": true,
+				"uint": true, "uint8": true, "uint16": true, "uint32": true, "uint64": true,
+				"float32": true, "float64": true, "complex64": true, "complex128": true,
+				"bool": true, "string": true, "byte": true, "rune": true, "error": true,
+				"any": true, "nil": true,
+				"void": true, "char": true, "double": true, "long": true, "short": true,
+				"size_t": true, "ssize_t": true, "uintptr_t": true,
+				"Map": true, "List": true, "Set": true, "Option": true, "Result": true,
+			}
+			if typeKW[strings.ToLower(fieldWords[1])] {
+				score += 12
+			}
+		}
+	}
 	// HTML/JSX/XML
 	if strings.Contains(trimmed, "</") || strings.Contains(trimmed, "/>") ||
 		strings.HasPrefix(trimmed, "<") && strings.Contains(trimmed, ">") {

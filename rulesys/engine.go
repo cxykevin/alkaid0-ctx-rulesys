@@ -229,7 +229,7 @@ func (e *Engine) reset() {
 // trimSegments 去除每段首尾的换行和空白
 func trimSegments(segments []Segment) {
 	for i, seg := range segments {
-		segments[i].Content = strings.Trim(seg.Content, "\n")
+		segments[i].Content = strings.TrimRight(seg.Content, "\n")
 	}
 }
 
