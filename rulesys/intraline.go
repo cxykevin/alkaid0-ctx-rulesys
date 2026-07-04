@@ -53,7 +53,7 @@ func splitSegmentAtBoundaries(seg Segment, threshold int) []Segment {
 		}
 
 		fragments := detectMixedLine(trimmed, seg.Type, threshold)
-		if len(fragments) < 2 {
+		if len(fragments) == 0 {
 			continue
 		}
 
@@ -72,10 +72,22 @@ func detectMixedLine(line string, segType SegmentType, threshold int) []segmentF
 		return nil
 	}
 
-	// 对 log segment 只做显式分隔短语检测（如 "错误信息:"）
-	// 防止整行被误判为 log 的场景
+	// log segment 检测：先做显式分隔短语，再检测末尾自然语言行
 	if segType == SegmentLog {
-		return detectExplicitDelimiter(line, threshold)
+		if result := detectExplicitDelimiter(line, threshold); result != nil {
+			return result
+		}
+		// 纯自然语言行（无 log/代码特征）混入 log 段 → 重分类为 prompt
+		trimmed := strings.TrimSpace(line)
+		if len(trimmed) >= minLineSplitLen {
+			cl := classifyLine(trimmed)
+			if cl.logScore < threshold && cl.codeScore < threshold {
+				return []segmentFragment{
+					{content: line, segType: SegmentPrompt},
+				}
+			}
+		}
+		return nil
 	}
 
 	// 只对 prompt 和 code 类型的 segment 进行完整分割
@@ -575,11 +587,17 @@ func buildSplitSegments(orig Segment, lines []string, splitLineIdx int, fragment
 	if splitLineIdx > 0 {
 		beforeContent := strings.Join(lines[:splitLineIdx], "\n")
 		if strings.TrimSpace(beforeContent) != "" {
-			result = append(result, NewSegment(fragments[0].segType, beforeContent))
+			// 单个 fragment = 整行重分类（如 log→prompt），前面的行保持原类型
+			// 多个 fragment = 行内分割，前面的行用首个 fragment 类型
+			beforeType := fragments[0].segType
+			if len(fragments) == 1 {
+				beforeType = orig.Type
+			}
+			result = append(result, NewSegment(beforeType, beforeContent))
 		}
 	}
 
-	// 分割行本身：拆分为两个 fragment
+	// 分割行本身
 	for _, frag := range fragments {
 		trimmed := strings.TrimSpace(frag.content)
 		if trimmed != "" {
