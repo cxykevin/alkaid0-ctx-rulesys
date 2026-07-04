@@ -302,7 +302,10 @@ func scoreCodeLine(line string) int {
 	// 结构体字段/变量声明（identifier type 模式，如 logScore int）
 	if !containsChinese(codePart) {
 		fieldWords := strings.Fields(codePart)
-		if len(fieldWords) == 2 {
+		if len(fieldWords) >= 2 {
+			second := fieldWords[1]
+			isFieldType := false
+			// 已知类型关键字
 			typeKW := map[string]bool{
 				"int": true, "int8": true, "int16": true, "int32": true, "int64": true,
 				"uint": true, "uint8": true, "uint16": true, "uint32": true, "uint64": true,
@@ -313,7 +316,24 @@ func scoreCodeLine(line string) int {
 				"size_t": true, "ssize_t": true, "uintptr_t": true,
 				"Map": true, "List": true, "Set": true, "Option": true, "Result": true,
 			}
-			if typeKW[strings.ToLower(fieldWords[1])] {
+			if typeKW[strings.ToLower(second)] {
+				isFieldType = true
+			}
+			// 指针类型 *TypeName
+			if strings.HasPrefix(second, "*") {
+				typeName := strings.TrimPrefix(second, "*")
+				if len(typeName) > 1 && !containsChinese(typeName) {
+					isFieldType = true
+				}
+			}
+			// 大写开头的自定义类型（如 LogEntry, MyStruct）
+			if len(second) > 1 {
+				firstR, _ := utf8.DecodeRuneInString(second)
+				if unicode.IsUpper(firstR) {
+					isFieldType = true
+				}
+			}
+			if isFieldType {
 				score += 12
 			}
 		}

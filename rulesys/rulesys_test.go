@@ -219,6 +219,37 @@ func TestCommentNotLog(t *testing.T) {
 	}
 }
 
+func TestStructFieldWithPointer(t *testing.T) {
+	// Struct fields with pointer types (e.g. entry *LogEntry) should be code
+	input := "修bug：\nfunc TestShouldDisplay(t *testing.T) {\n        tests := []struct {\n                name     string\n                entry    *LogEntry\n                minLevel string\n                expected bool\n        }{\n                {\n                        name: \"DEBUG with DEBUG min\",\n                        entry: &LogEntry{\n                                Level: \"DEBUG\",\n                        },\n                        minLevel: \"DEBUG\",\n                        expected: true,\n                },\n        }\n}"
+	segs := SplitString(input)
+	if len(segs) < 2 {
+		t.Errorf("expected at least 2 segments, got %d: %+v", len(segs), segs)
+	}
+	if len(segs) >= 1 && segs[0].Type != SegmentPrompt {
+		t.Errorf("segment 0 expected prompt, got %s: %q", segs[0].Type, segs[0].Content)
+	}
+	codeFound := false
+	for _, s := range segs {
+		if s.Type == SegmentCode {
+			codeFound = true
+			break
+		}
+	}
+	if !codeFound {
+		t.Errorf("expected a code segment: %+v", segs)
+	}
+	entryFoundAsPrompt := false
+	for _, s := range segs {
+		if s.Type == SegmentPrompt && strings.Contains(s.Content, "*LogEntry") {
+			entryFoundAsPrompt = true
+		}
+	}
+	if entryFoundAsPrompt {
+		t.Errorf("'*LogEntry' should be in code segment, not prompt: %+v", segs)
+	}
+}
+
 // --- 批量评估 ---
 
 type testRecord struct {
