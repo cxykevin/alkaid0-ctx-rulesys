@@ -86,6 +86,12 @@ func detectMixedLine(line string, segType SegmentType, threshold int) []segmentF
 					{content: line, segType: SegmentPrompt},
 				}
 			}
+			// 行首中文 + 后续日志内容 → 在中文与日志边界分割
+			if containsChinese(trimmed) {
+				if result := splitLogAtChineseBoundary(line, threshold); result != nil {
+					return result
+				}
+			}
 		}
 		return nil
 	}
@@ -575,6 +581,75 @@ func findEmbeddedKeyword(word string) int {
 		}
 	}
 	return -1
+}
+
+// splitLogAtChineseBoundary 在行首中文与后续日志内容之间分割
+func splitLogAtChineseBoundary(line string, threshold int) []segmentFragment {
+	runes := []rune(line)
+	// 找到第一个非中文字符的位置
+	firstNonHan := -1
+	for i, r := range runes {
+		if !unicode.Is(unicode.Han, r) && !unicode.IsSpace(r) {
+			firstNonHan = i
+			break
+		}
+	}
+	if firstNonHan <= 0 || firstNonHan >= len(runes)-1 {
+		return nil
+	}
+
+	// 跳过空白
+	contentStart := firstNonHan
+	for contentStart < len(runes) && (runes[contentStart] == ' ' || runes[contentStart] == '\t') {
+		contentStart++
+	}
+	if contentStart >= len(runes) {
+		return nil
+	}
+
+	// 检查后续内容是否以日志特征开头（年份数字或 [ 或 Error:）
+	suffixRune := runes[contentStart]
+	suffixByte := line[contentStart]
+	isLogStart := false
+	if suffixRune >= '0' && suffixRune <= '9' && contentStart+3 < len(runes) {
+		// 可能是年份：4位数字开头
+		if runes[contentStart+1] >= '0' && runes[contentStart+1] <= '9' &&
+			runes[contentStart+2] >= '0' && runes[contentStart+2] <= '9' &&
+			runes[contentStart+3] >= '0' && runes[contentStart+3] <= '9' {
+			isLogStart = true
+		}
+	}
+	if suffixByte == '[' || suffixByte == '(' {
+		isLogStart = true
+	}
+	if !isLogStart {
+		return nil
+	}
+
+	// 验证前缀确实是自然语言（非 log/代码）
+	prefix := strings.TrimSpace(string(runes[:firstNonHan]))
+	if len(prefix) < minPrefixLen {
+		return nil
+	}
+	prefixCL := classifyLine(prefix)
+	if prefixCL.logScore >= threshold || prefixCL.codeScore >= threshold {
+		return nil
+	}
+
+	// 验证后缀确实是 log
+	suffix := strings.TrimSpace(string(runes[contentStart:]))
+	if len(suffix) < minSuffixLen {
+		return nil
+	}
+	suffixCL := classifyLine(suffix)
+	if suffixCL.logScore < threshold {
+		return nil
+	}
+
+	return []segmentFragment{
+		{content: prefix, segType: SegmentPrompt},
+		{content: suffix, segType: SegmentLog},
+	}
 }
 
 // ─── 辅助函数 ───────────────────────────────────────────────────
