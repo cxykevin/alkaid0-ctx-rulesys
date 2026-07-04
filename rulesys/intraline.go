@@ -121,6 +121,15 @@ func detectMixedLine(line string, segType SegmentType, threshold int) []segmentF
 		return result
 	}
 
+	// 纯自然语言行混入 code 段 → 重分类为 prompt
+	if segType == SegmentCode {
+		if cl := classifyLine(line); cl.logScore < threshold && cl.codeScore < threshold {
+			return []segmentFragment{
+				{content: line, segType: SegmentPrompt},
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -292,8 +301,9 @@ func detectColonBoundary(line string, segType SegmentType, threshold int) []segm
 			continue
 		}
 
-		// 冒号后紧跟引号的是代码字面量（如 line:"2025/12/07"），跳过
-		if len(suffix) > 0 && (suffix[0] == '"' || suffix[0] == '\'') {
+		// 冒号后紧跟引号/&/* 的是代码字面量或表达式，跳过
+		if len(suffix) > 0 && (suffix[0] == '"' || suffix[0] == '\'' ||
+			suffix[0] == '&' || suffix[0] == '*') {
 			continue
 		}
 

@@ -226,10 +226,14 @@ func (e *Engine) reset() {
 	e.consecutiveNonMatch = 0
 }
 
-// trimSegments 去除每段首尾的换行和空白
+// trimSegments 去除首尾换行，保留段间分隔换行
 func trimSegments(segments []Segment) {
 	for i, seg := range segments {
 		segments[i].Content = strings.TrimRight(seg.Content, "\n")
+	}
+	// 为除最后一段外的每段补回换行（段间分隔）
+	for i := 0; i < len(segments)-1; i++ {
+		segments[i].Content += "\n"
 	}
 }
 
