@@ -258,6 +258,10 @@ func detectColonBoundary(line string, segType SegmentType, threshold int) []segm
 				continue
 			}
 		}
+		// := 赋值操作符中的冒号（Go/Python/etc.），跳过
+		if c.char == ':' && c.idx+1 < len(line) && line[c.idx+1] == '=' {
+			continue
+		}
 		// 行首就是冒号模式（如 C: 盘符）
 		if c.idx == 1 && unicode.IsLetter(rune(line[0])) {
 			continue
@@ -359,7 +363,7 @@ func detectPunctuationBoundary(line string, segType SegmentType, threshold int) 
 		if suffixCL.codeScore >= threshold || suffixCL.logScore >= threshold {
 			firstW := strings.ToUpper(firstWord(suffix))
 			if isStrongCodeStartWord(firstW) || isStrongLogStartWord(firstW) ||
-				suffixCL.codeScore >= threshold+5 || suffixCL.logScore >= threshold+5 {
+				isSuffixShellCommand(suffix) {
 				suffixType := SegmentCode
 				if suffixCL.logScore > suffixCL.codeScore {
 					suffixType = SegmentLog
@@ -410,6 +414,14 @@ func isStrongLogStartWord(word string) bool {
 		"RUNTIME": true,
 	}
 	return strong[word]
+}
+
+// isSuffixShellCommand 检查后缀是否以 shell 命令开头
+func isSuffixShellCommand(suffix string) bool {
+	firstW := firstWord(suffix)
+	firstUpper := strings.ToUpper(firstW)
+	// 利用 classifier 中的 matchShellCommand
+	return matchShellCommand(suffix, firstW, firstUpper) > 0
 }
 
 // ─── 词法边界 ───────────────────────────────────────────────────

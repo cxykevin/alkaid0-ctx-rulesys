@@ -289,6 +289,16 @@ func scoreCodeLine(line string) int {
 	if strings.Contains(trimmed, " | ") || strings.HasPrefix(trimmed, "|") {
 		score += 8
 	}
+	// 导入路径/包名（以引号开头的 import string）
+	if strings.HasPrefix(trimmed, "\"") && strings.HasSuffix(trimmed, "\"") {
+		rest := strings.TrimPrefix(trimmed, "\"")
+		rest = strings.TrimSuffix(rest, "\"")
+		if strings.Contains(rest, "/") {
+			score += 15
+		} else if len(rest) > 1 && !strings.Contains(rest, " ") && !containsChinese(rest) {
+			score += 12
+		}
+	}
 	// HTML/JSX/XML
 	if strings.Contains(trimmed, "</") || strings.Contains(trimmed, "/>") ||
 		strings.HasPrefix(trimmed, "<") && strings.Contains(trimmed, ">") {
