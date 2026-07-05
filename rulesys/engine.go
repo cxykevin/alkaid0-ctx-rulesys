@@ -6,7 +6,6 @@ import (
 	"strings"
 )
 
-// engineState 状态机内部状态
 type engineState int
 
 const (
@@ -15,236 +14,215 @@ const (
 	stateLog
 )
 
-// Engine 是流式规则引擎，将输入分割为 prompt/code/log 段
+// Engine 将输入流分割为 prompt/code/log 段
 type Engine struct {
-	// transitionThreshold 从 PROMPT 转换的最小得分
 	transitionThreshold int
-	// fenceOpen 标记当前是否在 ``` 代码围栏内
-	fenceOpen bool
-	// fenceLang 记录围栏的语言标记
-	fenceLang string
-	// consecutiveNonMatch 记录当前状态下连续不匹配的行数
+	fenceOpen           bool
+	fenceLang           string
 	consecutiveNonMatch int
+	blanksSinceSwitch   int // 切换后积累的空行数
 }
 
-// NewEngine 创建一个新的规则引擎
 func NewEngine() *Engine {
-	return &Engine{
-		transitionThreshold: 12,
-	}
+	return &Engine{transitionThreshold: 12}
 }
 
-// ProcessString 处理输入字符串并返回分割后的段
+func SplitString(input string) []Segment {
+	return NewEngine().ProcessString(input)
+}
+
+func SplitReader(r io.Reader) ([]Segment, error) {
+	return NewEngine().Process(r)
+}
+
 func (e *Engine) ProcessString(input string) []Segment {
 	return e.processLines(strings.Split(input, "\n"))
 }
 
-// Process 从 io.Reader 中流式读取并处理
 func (e *Engine) Process(reader io.Reader) ([]Segment, error) {
 	var lines []string
-	scanner := bufio.NewScanner(reader)
-	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
+	sc := bufio.NewScanner(reader)
+	for sc.Scan() {
+		lines = append(lines, sc.Text())
 	}
-	if err := scanner.Err(); err != nil {
+	if err := sc.Err(); err != nil {
 		return nil, err
 	}
 	return e.processLines(lines), nil
 }
 
-// processLines 处理按行分割的输入
 func (e *Engine) processLines(lines []string) []Segment {
 	e.reset()
-	var segments []Segment
-	var current strings.Builder
-	currentState := statePrompt
 
-	// 延迟 flush 辅助函数
-	flush := func(forceState engineState) {
-		if current.Len() > 0 {
-			segType := SegmentPrompt
-			switch forceState {
-			case stateCode:
-				segType = SegmentCode
-			case stateLog:
-				segType = SegmentLog
-			}
-			segments = append(segments, NewSegment(segType, current.String()))
-			current.Reset()
+	var segments []Segment
+	var cur strings.Builder
+	state := statePrompt
+	th := e.transitionThreshold
+
+	flush := func(st engineState) {
+		if cur.Len() == 0 {
+			return
 		}
+		t := SegmentPrompt
+		switch st {
+		case stateCode:
+			t = SegmentCode
+		case stateLog:
+			t = SegmentLog
+		}
+		segments = append(segments, NewSegment(t, cur.String()))
+		cur.Reset()
 	}
 
 	for _, line := range lines {
 		cl := classifyLine(line)
 
-		// ── 代码围栏处理 —— 优先级最高 ──
+		// ── 代码围栏（最高优先级）──
 		if cl.isCodeFence {
 			if e.fenceOpen {
-				// 闭合围栏
-				current.WriteString(line)
-				current.WriteByte('\n')
+				cur.WriteString(line)
+				cur.WriteByte('\n')
 				e.fenceOpen = false
-				e.fenceLang = ""
-				// 闭合后刷新当前段，下段回到 prompt
 				flush(stateCode)
-				currentState = statePrompt
-				continue
+				state = statePrompt
+				e.blanksSinceSwitch = 0
 			} else {
-				// 打开围栏
-				flush(currentState)
+				flush(state)
 				e.fenceOpen = true
 				e.fenceLang = cl.hasCodeFenceLang
-				currentState = stateCode
-				current.WriteString(line)
-				current.WriteByte('\n')
-				continue
+				state = stateCode
+				e.blanksSinceSwitch = 0
+				cur.WriteString(line)
+				cur.WriteByte('\n')
 			}
+			continue
 		}
 
-		// ── 在代码围栏内：强制为代码 ──
+		// ── 围栏内：强制代码 ──
 		if e.fenceOpen {
-			current.WriteString(line)
-			current.WriteByte('\n')
-			currentState = stateCode
+			cur.WriteString(line)
+			cur.WriteByte('\n')
 			continue
 		}
 
 		// ── 空行处理 ──
 		if isBlankLine(line) {
-			// 空行不触发状态切换，仅追加到当前段
-			current.WriteByte('\n')
+			cur.WriteByte('\n')
+			e.blanksSinceSwitch++
 			continue
 		}
 
-		// ── 根据得分确定行的最佳类型 ──
-		bestType := statePrompt
-		codeScore := cl.codeScore
-		logScore := cl.logScore
-
-		if codeScore >= e.transitionThreshold && codeScore >= logScore {
-			bestType = stateCode
-		} else if logScore >= e.transitionThreshold && logScore > codeScore {
-			bestType = stateLog
+		// ── 计算最佳类型 ──
+		best := statePrompt
+		if cl.codeScore >= th && cl.codeScore >= cl.logScore {
+			best = stateCode
+		} else if cl.logScore >= th && cl.logScore > cl.codeScore {
+			best = stateLog
 		}
 
-		// ── 状态转换逻辑 ──
-
-		if bestType == currentState {
-			// 同一状态：追加行，重置计数
+		// ── 状态转换 ──
+		if best == state {
 			e.consecutiveNonMatch = 0
-			current.WriteString(line)
-			current.WriteByte('\n')
+			cur.WriteString(line)
+			cur.WriteByte('\n')
 			continue
 		}
 
-		if bestType == statePrompt {
-			// 当前行判定为 prompt，但可能在 code/log 段内
-			// 在 CODE 或 LOG 段内出现 prompt 行时，惰性转换
-			if currentState == stateCode || currentState == stateLog {
-				e.consecutiveNonMatch++
-				if e.consecutiveNonMatch >= 3 {
-					// 连续 2 行非代码/日志 → 刷新并切换回 prompt
-					flush(currentState)
-					currentState = statePrompt
-					e.consecutiveNonMatch = 0
-					current.WriteString(line)
-					current.WriteByte('\n')
-				} else {
-					// 仅 1 行非匹配：暂不切换，但记录
-					current.WriteString(line)
-					current.WriteByte('\n')
+		// 当前行判定为 prompt，但在 code/log 段内
+		if best == statePrompt && (state == stateCode || state == stateLog) {
+			// 空行后允许更快切换（threshold=1）
+			nonMatchThreshold := 2
+			if e.blanksSinceSwitch > 0 {
+				nonMatchThreshold = 1
+			}
+			e.consecutiveNonMatch++
+			cur.WriteString(line)
+			cur.WriteByte('\n')
+			if e.consecutiveNonMatch >= nonMatchThreshold {
+				// 把最后 consecutiveNonMatch 行划入新 prompt 段
+				content := cur.String()
+				// 找到倒数 nonMatchThreshold 行的起点
+				splitPos := findSplitPos(content, nonMatchThreshold)
+				codeContent := content[:splitPos]
+				promptContent := content[splitPos:]
+				cur.Reset()
+				if strings.TrimSpace(codeContent) != "" {
+					segments = append(segments, NewSegment(segTypeOf(state), codeContent))
 				}
-				continue
+				cur.WriteString(promptContent)
+				state = statePrompt
+				e.consecutiveNonMatch = 0
+				e.blanksSinceSwitch = 0
 			}
-			// 已在 prompt 状态下，直接追加
-			current.WriteString(line)
-			current.WriteByte('\n')
-			e.consecutiveNonMatch = 0
 			continue
 		}
 
-		// bestType != currentState 且 bestType 非 prompt
-		// 从 prompt → code 或 prompt → log
-		if currentState == statePrompt {
-			if current.Len() > 0 {
-				flush(statePrompt)
-			}
-			currentState = bestType
-			e.consecutiveNonMatch = 0
-			current.WriteString(line)
-			current.WriteByte('\n')
-			continue
-		}
-
-		// CODE ↔ LOG 之间的转换
-		if bestType == stateCode && currentState == stateLog {
-			// 从 log → code
-			flush(stateLog)
-			currentState = stateCode
-			e.consecutiveNonMatch = 0
-			current.WriteString(line)
-			current.WriteByte('\n')
-			continue
-		}
-
-		if bestType == stateLog && currentState == stateCode {
-			// 从 code → log
-			flush(stateCode)
-			currentState = stateLog
-			e.consecutiveNonMatch = 0
-			current.WriteString(line)
-			current.WriteByte('\n')
-			continue
-		}
-
-		// fallback：追加到当前段
-		current.WriteString(line)
-		current.WriteByte('\n')
+		// prompt → code/log 或 code ↔ log
+		flush(state)
+		state = best
+		e.consecutiveNonMatch = 0
+		e.blanksSinceSwitch = 0
+		cur.WriteString(line)
+		cur.WriteByte('\n')
 	}
 
-	// 刷新最后一段
-	if current.Len() > 0 {
-		flush(currentState)
-	} else if e.fenceOpen {
-		// 未闭合的围栏：将围栏之前的代码段刷新
-		// fenceOpen 状态下 current 为空时不做额外处理
+	if cur.Len() > 0 {
+		flush(state)
 	}
 
-	// 清理：去除每段首尾的空白/换行
 	trimSegments(segments)
-
-	// 行内分割后处理：识别同一行内 prompt→code/log 的转换边界
-	segments = splitIntraLine(segments, e.transitionThreshold)
-
-	return segments
+	return splitIntraLine(segments, th)
 }
 
-// reset 重置引擎状态
+// findSplitPos 在 content 中找到"倒数 n 个非空行"的起始字节位置
+func findSplitPos(content string, n int) int {
+	lines := strings.Split(content, "\n")
+	// 从后往前找 n 个非空行
+	count := 0
+	splitLine := len(lines)
+	for i := len(lines) - 1; i >= 0; i-- {
+		if strings.TrimSpace(lines[i]) != "" {
+			count++
+			if count == n {
+				splitLine = i
+				break
+			}
+		}
+	}
+	if splitLine == len(lines) {
+		return 0
+	}
+	// 计算字节偏移
+	pos := 0
+	for i := 0; i < splitLine; i++ {
+		pos += len(lines[i]) + 1 // +1 for '\n'
+	}
+	return pos
+}
+
+func segTypeOf(st engineState) SegmentType {
+	switch st {
+	case stateCode:
+		return SegmentCode
+	case stateLog:
+		return SegmentLog
+	default:
+		return SegmentPrompt
+	}
+}
+
 func (e *Engine) reset() {
 	e.fenceOpen = false
 	e.fenceLang = ""
 	e.consecutiveNonMatch = 0
+	e.blanksSinceSwitch = 0
 }
 
-// trimSegments 去除首尾换行，保留段间分隔换行
 func trimSegments(segments []Segment) {
 	for i, seg := range segments {
 		segments[i].Content = strings.TrimRight(seg.Content, "\n")
 	}
-	// 为除最后一段外的每段补回换行（段间分隔）
 	for i := 0; i < len(segments)-1; i++ {
 		segments[i].Content += "\n"
 	}
-}
-
-// SplitString 便捷函数：直接处理字符串
-func SplitString(input string) []Segment {
-	engine := NewEngine()
-	return engine.ProcessString(input)
-}
-
-// SplitReader 便捷函数：从 io.Reader 处理
-func SplitReader(reader io.Reader) ([]Segment, error) {
-	engine := NewEngine()
-	return engine.Process(reader)
 }

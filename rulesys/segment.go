@@ -4,15 +4,11 @@ package rulesys
 type SegmentType int
 
 const (
-	// SegmentPrompt 是自然语言描述/问题/指示（包括 info/rule/link 等辅助文本）
-	SegmentPrompt SegmentType = iota
-	// SegmentCode 是代码片段（各种语言）
-	SegmentCode
-	// SegmentLog 是错误日志、堆栈跟踪、构建输出等
-	SegmentLog
+	SegmentPrompt SegmentType = iota // 自然语言描述/问题/指示
+	SegmentCode                      // 代码片段（各种语言）
+	SegmentLog                       // 错误日志、堆栈跟踪、构建输出
 )
 
-// String 返回 SegmentType 的可读名称
 func (st SegmentType) String() string {
 	switch st {
 	case SegmentPrompt:
@@ -32,7 +28,6 @@ type Segment struct {
 	Content string
 }
 
-// NewSegment 创建一个新的分段
 func NewSegment(st SegmentType, content string) Segment {
 	return Segment{Type: st, Content: content}
 }

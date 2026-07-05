@@ -250,6 +250,52 @@ func TestStructFieldWithPointer(t *testing.T) {
 	}
 }
 
+func TestJSONWithChineseTail(t *testing.T) {
+	input := "{\n  \"files\": [],\n  \"references\": [\n    { \"path\": \"./tsconfig.app.json\" },\n    { \"path\": \"./tsconfig.node.json\" }\n  ]\n}\n解释一下"
+	segs := SplitString(input)
+	codeFound := false
+	promptChinese := false
+	for _, s := range segs {
+		if s.Type == SegmentCode {
+			codeFound = true
+		}
+		if s.Type == SegmentPrompt && strings.Contains(s.Content, "解释一下") {
+			promptChinese = true
+		}
+	}
+	if !codeFound {
+		t.Errorf("expected a code segment for JSON: %+v", segs)
+	}
+	if !promptChinese {
+		t.Errorf("expected '解释一下' in a prompt segment: %+v", segs)
+	}
+}
+
+func TestCodeSegmentEndingWithChinese(t *testing.T) {
+	input := "{\n                        name: \"INFO with DEBUG min\",\n                        entry: &LogEntry{\n                                Level: \"INFO\",\n                        },这是什么"
+	segs := SplitString(input)
+	chineseInPrompt := false
+	for _, s := range segs {
+		if s.Type == SegmentPrompt && strings.Contains(s.Content, "这是什么") {
+			chineseInPrompt = true
+		}
+	}
+	if !chineseInPrompt {
+		t.Errorf("expected '这是什么' in a prompt segment: %+v", segs)
+	}
+}
+
+func TestColonFollowedByQuote(t *testing.T) {
+	input := "line:\"2025/12/07 14:04:35 [INFO][log] log inited\","
+	segs := SplitString(input)
+	if len(segs) != 1 {
+		t.Errorf("expected single code segment, got %d: %+v", len(segs), segs)
+	}
+	if len(segs) == 1 && segs[0].Type != SegmentCode {
+		t.Errorf("expected code, got %s: %q", segs[0].Type, segs[0].Content)
+	}
+}
+
 // --- 批量评估 ---
 
 type testRecord struct {

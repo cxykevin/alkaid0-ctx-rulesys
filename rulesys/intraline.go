@@ -6,209 +6,162 @@ import (
 	"unicode/utf8"
 )
 
-// segmentFragment 表示行内分割后的一个片段
-type segmentFragment struct {
-	content string
-	segType SegmentType
-}
-
-// 行内分割最小长度常量
 const (
-	minSegmentSplitLen = 5  // segment 最小长度才触发行内检测
-	minLineSplitLen    = 10 // 单行最小长度才触发行内检测
-	minPrefixLen       = 2  // 前缀最小长度
-	minSuffixLen       = 3  // 后缀最小长度
+	minSegLen  = 5
+	minLineLen = 8
+	minPrefix  = 2
+	minSuffix  = 3
 )
 
-// splitIntraLine 在所有 segment 上执行行内分割后处理
+type fragment struct {
+	content string
+	typ     SegmentType
+}
+
+// splitIntraLine 对所有 segment 执行行内分割后处理
 func splitIntraLine(segments []Segment, threshold int) []Segment {
 	if threshold <= 0 {
 		threshold = 12
 	}
-	if len(segments) == 0 {
-		return segments
-	}
-
-	var result []Segment
+	var out []Segment
 	for _, seg := range segments {
-		sub := splitSegmentAtBoundaries(seg, threshold)
-		result = append(result, sub...)
+		out = append(out, splitSegment(seg, threshold)...)
 	}
-	return result
+	return out
 }
 
-// splitSegmentAtBoundaries 检查单个 segment 是否包含混合类型的行
-func splitSegmentAtBoundaries(seg Segment, threshold int) []Segment {
-	content := seg.Content
-	if len(content) < minSegmentSplitLen {
+// splitSegment 检查单个 segment 是否含混合类型的行
+func splitSegment(seg Segment, th int) []Segment {
+	if len(seg.Content) < minSegLen {
 		return []Segment{seg}
 	}
-
-	lines := strings.Split(content, "\n")
-
+	lines := strings.Split(seg.Content, "\n")
 	for i, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if len(trimmed) < minLineSplitLen {
+		t := strings.TrimSpace(line)
+		if len(t) < minLineLen {
 			continue
 		}
-
-		fragments := detectMixedLine(trimmed, seg.Type, threshold)
-		if len(fragments) == 0 {
+		// 整行得分强烈偏向当前类型时，不尝试分割（避免代码内部误拆）
+		cl := classifyLine(t)
+		if seg.Type == SegmentCode && cl.codeScore >= th*2 {
 			continue
 		}
-
-		// 在此行找到边界 → 拆分段
-		return buildSplitSegments(seg, lines, i, fragments)
+		if seg.Type == SegmentLog && cl.logScore >= th*2 {
+			continue
+		}
+		if frags := detectMixed(t, seg.Type, th); len(frags) > 0 {
+			return buildSplit(seg, lines, i, frags)
+		}
 	}
-
 	return []Segment{seg}
 }
 
-// detectMixedLine 检测单行中是否存在类型边界
-// 返回 nil 表示未找到边界
-func detectMixedLine(line string, segType SegmentType, threshold int) []segmentFragment {
-	// 如果行包含代码围栏标记，不分割
-	if isCodeFence(strings.TrimSpace(line)) {
+// detectMixed 检测单行内的类型边界，返回 nil 表示无边界
+func detectMixed(line string, segTyp SegmentType, th int) []fragment {
+	if strings.HasPrefix(line, "```") {
 		return nil
 	}
 
-	// log segment 检测：先做显式分隔短语，再检测末尾自然语言行
-	if segType == SegmentLog {
-		if result := detectExplicitDelimiter(line, threshold); result != nil {
-			return result
+	switch segTyp {
+	case SegmentLog:
+		if f := detectExplicitDelimiter(line, th); f != nil {
+			return f
 		}
-		// 纯自然语言行（无 log/代码特征）混入 log 段 → 重分类为 prompt
-		trimmed := strings.TrimSpace(line)
-		if len(trimmed) >= minLineSplitLen {
-			cl := classifyLine(trimmed)
-			if cl.logScore < threshold && cl.codeScore < threshold {
-				return []segmentFragment{
-					{content: line, segType: SegmentPrompt},
-				}
-			}
-			// 行首中文 + 后续日志内容 → 在中文与日志边界分割
-			if containsChinese(trimmed) {
-				if result := splitLogAtChineseBoundary(line, threshold); result != nil {
-					return result
-				}
+		// 纯自然语言行混入 log 段
+		cl := classifyLine(line)
+		if cl.logScore < th && cl.codeScore < th {
+			return []fragment{{content: line, typ: SegmentPrompt}}
+		}
+		// 行首中文 + 日志内容
+		if containsChinese(line) {
+			return splitLogAtChinese(line, th)
+		}
+		return nil
+
+	case SegmentPrompt:
+		if f := detectExplicitDelimiter(line, th); f != nil {
+			return f
+		}
+		if f := detectColonBoundary(line, segTyp, th); f != nil {
+			return f
+		}
+		if f := detectPunctuationBoundary(line, segTyp, th); f != nil {
+			return f
+		}
+		if f := detectKeywordBoundary(line, segTyp, th); f != nil {
+			return f
+		}
+		return nil
+
+	case SegmentCode:
+		if f := detectExplicitDelimiter(line, th); f != nil {
+			return f
+		}
+		if f := detectColonBoundary(line, segTyp, th); f != nil {
+			return f
+		}
+		if f := detectPunctuationBoundary(line, segTyp, th); f != nil {
+			return f
+		}
+		if f := detectKeywordBoundary(line, segTyp, th); f != nil {
+			return f
+		}
+		// 纯自然语言行混入 code 段（排除注释和 docstring）
+		if !isCodeComment(line) && !strings.HasPrefix(line, "\"\"\"") {
+			cl := classifyLine(line)
+			if cl.logScore < th && cl.codeScore < th {
+				return []fragment{{content: line, typ: SegmentPrompt}}
 			}
 		}
 		return nil
 	}
-
-	// 只对 prompt 和 code 类型的 segment 进行完整分割
-	if segType != SegmentPrompt && segType != SegmentCode {
-		return nil
-	}
-
-	// 优先级 1：显式分隔短语
-	if result := detectExplicitDelimiter(line, threshold); result != nil {
-		return result
-	}
-
-	// 优先级 2：冒号边界
-	if result := detectColonBoundary(line, segType, threshold); result != nil {
-		return result
-	}
-
-	// 优先级 3：句尾标点边界
-	if result := detectPunctuationBoundary(line, segType, threshold); result != nil {
-		return result
-	}
-
-	// 优先级 4：词法边界（无标点的代码关键词转换）
-	if result := detectCodeKeywordBoundary(line, segType, threshold); result != nil {
-		return result
-	}
-
-	// 纯自然语言行混入 code 段 → 重分类为 prompt
-	if segType == SegmentCode {
-		if cl := classifyLine(line); cl.logScore < threshold && cl.codeScore < threshold {
-			return []segmentFragment{
-				{content: line, segType: SegmentPrompt},
-			}
-		}
-	}
-
 	return nil
 }
 
-// ─── 显式分隔短语 ──────────────────────────────────────────────
+// ─── 显式分隔短语 ─────────────────────────────────────────────────────────────
 
-// codeDelimiters 指示后面内容为代码的分隔短语
 var codeDelimiters = []string{
-	"here's the code:",
-	"here is the code:",
-	"here's my code:",
-	"here is my code:",
-	"here it is:",
-	"the code is:",
-	"the code:",
-	"代码如下：",
-	"代码是：",
-	"代码是这样的：",
-	"代码：",
-	"这段代码：",
-	"参考代码：",
-	"示例代码：",
-	"代码片段：",
-	"代码片段:",
+	"here's the code:", "here is the code:", "here's my code:", "here is my code:",
+	"here it is:", "the code is:", "the code:",
+	"代码如下：", "代码是：", "代码是这样的：", "代码：", "这段代码：",
+	"参考代码：", "示例代码：", "代码片段：", "代码片段:",
 }
 
-// logDelimiters 指示后面内容为日志/错误的分隔短语
 var logDelimiters = []string{
-	"报错信息：",
-	"报错：",
-	"错误信息：",
-	"错误：",
-	"error message:",
-	"error:",
-	"报错如下：",
-	"错误如下：",
-	"日志：",
-	"日志如下：",
-	"错误日志：",
+	"报错信息：", "报错：", "错误信息：", "错误：",
+	"error message:", "error:",
+	"报错如下：", "错误如下：", "日志：", "日志如下：", "错误日志：",
 }
 
-// detectExplicitDelimiter 查找已知的分隔短语
-func detectExplicitDelimiter(line string, threshold int) []segmentFragment {
+func detectExplicitDelimiter(line string, th int) []fragment {
 	lower := strings.ToLower(line)
 
-	// 检查代码分隔短语
 	for _, phrase := range codeDelimiters {
 		idx := strings.Index(lower, strings.ToLower(phrase))
 		if idx < 0 {
 			continue
 		}
-		// 短语必须在词边界处（行首或前面是空格/标点）
 		if idx > 0 {
 			prev, _ := utf8.DecodeLastRuneInString(line[:idx])
 			if !isWordBoundary(prev) {
 				continue
 			}
 		}
-
 		suffix := strings.TrimSpace(line[idx+len(phrase):])
-		if len(suffix) < minSuffixLen {
+		if len(suffix) < minSuffix {
 			continue
 		}
-
-		// 验证后缀确实像代码
 		cl := classifyLine(suffix)
-		if cl.codeScore >= threshold || cl.logScore >= threshold {
-			suffixType := SegmentCode
+		if cl.codeScore >= th || cl.logScore >= th {
+			typ := SegmentCode
 			if cl.logScore > cl.codeScore {
-				suffixType = SegmentLog
+				typ = SegmentLog
 			}
 			prefix := strings.TrimRight(line[:idx+len(phrase)], " ")
-			return []segmentFragment{
-				{content: prefix, segType: SegmentPrompt},
-				{content: suffix, segType: suffixType},
-			}
+			return []fragment{{content: prefix, typ: SegmentPrompt}, {content: suffix, typ: typ}}
 		}
 	}
 
-	// 检查日志分隔短语
 	for _, phrase := range logDelimiters {
 		idx := strings.Index(lower, strings.ToLower(phrase))
 		if idx < 0 {
@@ -220,200 +173,196 @@ func detectExplicitDelimiter(line string, threshold int) []segmentFragment {
 				continue
 			}
 		}
-
 		suffix := strings.TrimSpace(line[idx+len(phrase):])
-		if len(suffix) < minSuffixLen {
+		if len(suffix) < minSuffix {
 			continue
 		}
-
 		prefixRaw := strings.TrimRight(line[:idx+len(phrase)], " ")
-		
-		// 验证前缀本身不是日志/代码内容（防止 "Error:" 行被误分割）
-		prefixCL := classifyLine(prefixRaw)
-		if prefixCL.logScore >= threshold || prefixCL.codeScore >= threshold {
+		// 前缀本身若是日志/代码，不分割
+		if pcl := classifyLine(prefixRaw); pcl.logScore >= th || pcl.codeScore >= th {
 			continue
 		}
-		
 		cl := classifyLine(suffix)
-		if cl.logScore >= threshold || cl.codeScore >= threshold {
-			suffixType := SegmentLog
-			if cl.codeScore > cl.logScore && cl.logScore < threshold {
-				suffixType = SegmentCode
+		if cl.logScore >= th || cl.codeScore >= th {
+			typ := SegmentLog
+			if cl.codeScore > cl.logScore {
+				typ = SegmentCode
 			}
-			return []segmentFragment{
-				{content: prefixRaw, segType: SegmentPrompt},
-				{content: suffix, segType: suffixType},
-			}
+			return []fragment{{content: prefixRaw, typ: SegmentPrompt}, {content: suffix, typ: typ}}
 		}
 	}
-
 	return nil
 }
 
-// ─── 冒号边界 ───────────────────────────────────────────────────
+// ─── 冒号边界 ─────────────────────────────────────────────────────────────────
 
-// detectColonBoundary 查找 : 或 ：分隔的边界
-func detectColonBoundary(line string, segType SegmentType, threshold int) []segmentFragment {
-	// 收集所有冒号位置（: U+003A 和 ：U+FF1A）
-	var colons []struct {
-		idx  int
-		char rune
-	}
+func detectColonBoundary(line string, segTyp SegmentType, th int) []fragment {
 	for i, r := range line {
-		if r == ':' || r == '：' {
-			colons = append(colons, struct {
-				idx  int
-				char rune
-			}{i, r})
+		if r != ':' && r != '：' {
+			continue
+		}
+		// 跳过 http:// https://
+		if r == ':' && i >= 4 && strings.HasPrefix(line[i-4:], "http") {
+			continue
+		}
+		// 跳过时间戳中的冒号（HH:MM:SS）
+		if r == ':' && i >= 2 && i+2 < len(line) {
+			if isDigit(rune(line[i-1])) && isDigit(rune(line[i-2])) &&
+				isDigit(rune(line[i+1])) && isDigit(rune(line[i+2])) {
+				continue
+			}
+		}
+		// 跳过 :=
+		if r == ':' && i+1 < len(line) && line[i+1] == '=' {
+			continue
+		}
+		// 跳过盘符（C:）
+		if r == ':' && i == 1 && unicode.IsLetter(rune(line[0])) {
+			continue
+		}
+
+		prefix := strings.TrimSpace(line[:i])
+		charLen := len(string(r))
+		suffix := strings.TrimSpace(line[i+charLen:])
+
+		if len(prefix) < minPrefix || len(suffix) < minSuffix {
+			continue
+		}
+
+		// ★ 关键修复：前缀是引号包裹的 token（JSON/JS 对象 key）→ 不分割
+		if isQuotedToken(prefix) {
+			continue
+		}
+
+		// 冒号后紧跟引号/&/* 等代码字面量起始 → 不分割
+		if suffix[0] == '"' || suffix[0] == '\'' || suffix[0] == '`' ||
+			suffix[0] == '&' || suffix[0] == '*' || suffix[0] == '[' ||
+			suffix[0] == '{' || suffix[0] == '(' {
+			continue
+		}
+
+		// 前缀必须看起来是自然语言（有 NL 词 或 包含中文）
+		if !isNLPrefix(prefix) {
+			continue
+		}
+
+		pcl := classifyLine(prefix)
+		if pcl.codeScore >= th || pcl.logScore >= th {
+			continue
+		}
+
+		scl := classifyLine(suffix)
+		if scl.codeScore >= th || scl.logScore >= th {
+			typ := SegmentCode
+			if scl.logScore > scl.codeScore {
+				typ = SegmentLog
+			}
+			pfx := strings.TrimRight(line[:i+charLen], " ")
+			return []fragment{{content: pfx, typ: SegmentPrompt}, {content: suffix, typ: typ}}
 		}
 	}
-
-	for _, c := range colons {
-		// URL 中的冒号不处理（http:// https://）
-		if c.char == ':' && c.idx >= 4 {
-			if line[c.idx-4:c.idx+1] == "http:" {
-				continue
-			}
-			if c.idx >= 5 && line[c.idx-5:c.idx+1] == "https:" {
-				continue
-			}
-		}
-		// 时间戳中的冒号（如 12:00:00）
-		if c.char == ':' && c.idx >= 2 && c.idx+2 < len(line) {
-			if isDigit(rune(line[c.idx-1])) && isDigit(rune(line[c.idx-2])) &&
-				isDigit(rune(line[c.idx+1])) && isDigit(rune(line[c.idx+2])) {
-				continue
-			}
-		}
-		// := 赋值操作符中的冒号（Go/Python/etc.），跳过
-		if c.char == ':' && c.idx+1 < len(line) && line[c.idx+1] == '=' {
-			continue
-		}
-		// 行首就是冒号模式（如 C: 盘符）
-		if c.idx == 1 && unicode.IsLetter(rune(line[0])) {
-			continue
-		}
-
-		prefix := strings.TrimSpace(line[:c.idx])
-		suffix := strings.TrimSpace(line[c.idx+len(string(c.char)):])
-
-		if len(prefix) < minPrefixLen || len(suffix) < minSuffixLen {
-			continue
-		}
-
-		// 冒号后紧跟引号/&/* 的是代码字面量或表达式，跳过
-		if len(suffix) > 0 && (suffix[0] == '"' || suffix[0] == '\'' ||
-			suffix[0] == '&' || suffix[0] == '*') {
-			continue
-		}
-
-		// 前缀验证：前缀不应该像代码或日志
-		prefixCL := classifyLine(prefix)
-		if prefixCL.codeScore >= threshold || prefixCL.logScore >= threshold {
-			continue
-		}
-
-		// 后缀验证：后缀应该像代码或日志
-		suffixCL := classifyLine(suffix)
-		if suffixCL.codeScore >= threshold || suffixCL.logScore >= threshold {
-			prefixContent := strings.TrimRight(line[:c.idx+len(string(c.char))], " ")
-			suffixType := SegmentCode
-			if suffixCL.logScore > suffixCL.codeScore {
-				suffixType = SegmentLog
-			}
-			return []segmentFragment{
-				{content: prefixContent, segType: SegmentPrompt},
-				{content: suffix, segType: suffixType},
-			}
-		}
-	}
-
 	return nil
 }
 
-// ─── 句尾标点边界 ───────────────────────────────────────────────
-
-// sentenceEndPunctuation 句尾标点集合
-var sentenceEndPunctuation = map[rune]bool{
-	'.': true, '。': true,
-	'!': true, '！': true,
-	'?': true, '？': true,
+// isQuotedToken 判断字符串是否是单个引号包裹的 token（JSON/JS 对象 key）
+func isQuotedToken(s string) bool {
+	if len(s) < 2 {
+		return false
+	}
+	for _, q := range []byte{'"', '\'', '`'} {
+		if s[0] == q && s[len(s)-1] == q && !strings.Contains(s[1:len(s)-1], " ") {
+			return true
+		}
+	}
+	return false
 }
 
-// detectPunctuationBoundary 查找句尾标点后的代码/日志
-func detectPunctuationBoundary(line string, segType SegmentType, threshold int) []segmentFragment {
-	runes := []rune(line)
+// isNLPrefix 前缀是否像自然语言（有≥1 个 NL 词，或含中文，或≥3 个词）
+func isNLPrefix(prefix string) bool {
+	if containsChinese(prefix) {
+		return true
+	}
+	words := strings.Fields(prefix)
+	if len(words) >= 3 {
+		return true
+	}
+	for _, w := range words {
+		if naturalLanguageWords[strings.ToLower(w)] {
+			return true
+		}
+	}
+	return false
+}
 
+// ─── 句尾标点边界 ─────────────────────────────────────────────────────────────
+
+var sentenceEndPunct = map[rune]bool{'.': true, '。': true, '!': true, '！': true, '?': true, '？': true}
+
+func detectPunctuationBoundary(line string, segTyp SegmentType, th int) []fragment {
+	runes := []rune(line)
 	for i, r := range runes {
-		if !sentenceEndPunctuation[r] {
+		if !sentenceEndPunct[r] {
 			continue
 		}
-
-		// 确保后面有内容
 		if i+1 >= len(runes) {
 			continue
 		}
-
-		// 跳过标点后的空格
-		nextIdx := i + 1
-		for nextIdx < len(runes) && (runes[nextIdx] == ' ' || runes[nextIdx] == '\t') {
-			nextIdx++
+		next := i + 1
+		for next < len(runes) && (runes[next] == ' ' || runes[next] == '\t') {
+			next++
 		}
-		if nextIdx >= len(runes) {
+		if next >= len(runes) {
 			continue
 		}
-
-		// 检查标点后是否是 URL 路径（如 ./path/to/file）
-		if r == '.' && nextIdx < len(runes) && runes[nextIdx] == '/' {
-			continue
-		}
-		// 数字中的小数点
-		if r == '.' && i > 0 && i+1 < len(runes) &&
-			isDigit(runes[i-1]) && isDigit(runes[nextIdx]) {
-			continue
-		}
-
-		prefixByteLen := len(string(runes[:i+1]))
-		suffix := strings.TrimSpace(line[prefixByteLen:])
-
-		if len(suffix) < minSuffixLen {
-			continue
-		}
-
-		prefixStr := strings.TrimSpace(line[:prefixByteLen])
-		if len(prefixStr) < minPrefixLen {
-			continue
-		}
-
-		// 前缀验证：前缀不应该像代码或日志
-		prefixCL := classifyLine(prefixStr)
-		if prefixCL.codeScore >= threshold || prefixCL.logScore >= threshold {
-			continue
-		}
-
-		// 后缀验证：后缀应该像代码或日志（要求强信号）
-		suffixCL := classifyLine(suffix)
-		if suffixCL.codeScore >= threshold || suffixCL.logScore >= threshold {
-			firstW := strings.ToUpper(firstWord(suffix))
-			if isStrongCodeStartWord(firstW) || isStrongLogStartWord(firstW) ||
-				isSuffixShellCommand(suffix) {
-				suffixType := SegmentCode
-				if suffixCL.logScore > suffixCL.codeScore {
-					suffixType = SegmentLog
-				}
-				return []segmentFragment{
-					{content: prefixStr, segType: SegmentPrompt},
-					{content: suffix, segType: suffixType},
-				}
+		// 排除：小数点、文件路径 ./
+		if r == '.' {
+			if i > 0 && isDigit(runes[i-1]) && isDigit(runes[next]) {
+				continue
+			}
+			if runes[next] == '/' {
+				continue
 			}
 		}
-	}
 
+		prefixBytes := len(string(runes[:i+1]))
+		prefix := strings.TrimSpace(line[:prefixBytes])
+		suffix := strings.TrimSpace(line[prefixBytes:])
+
+		if len(prefix) < minPrefix || len(suffix) < minSuffix {
+			continue
+		}
+
+		// 前缀须是自然语言
+		if !isNLPrefix(prefix) {
+			continue
+		}
+
+		pcl := classifyLine(prefix)
+		if pcl.codeScore >= th || pcl.logScore >= th {
+			continue
+		}
+
+		scl := classifyLine(suffix)
+		if scl.codeScore < th && scl.logScore < th {
+			continue
+		}
+
+		// 后缀须以强代码/日志词开头
+		fw := strings.ToUpper(firstWord(suffix))
+		if !isStrongCodeStart(fw) && !isStrongLogStart(fw) && matchShellCommand(suffix, firstWord(suffix), fw) == 0 {
+			continue
+		}
+
+		typ := SegmentCode
+		if scl.logScore > scl.codeScore {
+			typ = SegmentLog
+		}
+		return []fragment{{content: prefix, typ: SegmentPrompt}, {content: suffix, typ: typ}}
+	}
 	return nil
 }
 
-// isStrongCodeStartWord 检查单词是否是强烈的代码起始信号
-func isStrongCodeStartWord(word string) bool {
+func isStrongCodeStart(w string) bool {
 	strong := map[string]bool{
 		"SELECT": true, "INSERT": true, "UPDATE": true, "DELETE": true,
 		"CREATE": true, "ALTER": true, "DROP": true,
@@ -426,177 +375,132 @@ func isStrongCodeStartWord(word string) bool {
 		"FOR": true, "IF": true, "WHILE": true, "SWITCH": true,
 		"RETURN": true, "ASYNC": true, "AWAIT": true,
 		"PRINT": true, "PRINTF": true,
-		"#INCLUDE": true, "#DEFINE": true, "#IFNDEF": true, "#IFDEF": true,
-		"MODULE": true, "REQUIRE": true,
-		"DECLARE": true, "NAMESPACE": true,
+		"#INCLUDE": true, "#DEFINE": true,
+		"MODULE": true, "REQUIRE": true, "DECLARE": true, "NAMESPACE": true,
 	}
-	return strong[word]
+	return strong[w]
 }
 
-// isStrongLogStartWord 检查单词是否是强烈的日志起始信号
-func isStrongLogStartWord(word string) bool {
+func isStrongLogStart(w string) bool {
 	strong := map[string]bool{
-		"ERROR:": true, "ERROR": true,
-		"PANIC:": true, "PANIC": true,
-		"FATAL:": true, "FATAL": true,
-		"E:": true,
-		"FAILED": true, "FAIL": true,
-		"WARN:": true, "WARNING:": true,
-		"TRACE:": true, "DEBUG:": true,
-		"EXCEPTION:": true,
-		"RUNTIME": true,
+		"ERROR": true, "ERROR:": true, "PANIC": true, "PANIC:": true,
+		"FATAL": true, "FATAL:": true, "FAILED": true, "FAIL": true,
+		"WARN": true, "WARN:": true, "WARNING": true, "WARNING:": true,
+		"EXCEPTION:": true, "RUNTIME": true,
 	}
-	return strong[word]
+	return strong[w]
 }
 
-// isSuffixShellCommand 检查后缀是否以 shell 命令开头
-func isSuffixShellCommand(suffix string) bool {
-	firstW := firstWord(suffix)
-	firstUpper := strings.ToUpper(firstW)
-	// 利用 classifier 中的 matchShellCommand
-	return matchShellCommand(suffix, firstW, firstUpper) > 0
+// ─── 词法边界（无标点代码关键词）────────────────────────────────────────────────
+
+// unambiguousCodeKW 无歧义的代码关键词（不会出现在自然语言中）
+var unambiguousCodeKW = map[string]bool{
+	"SELECT": true, "INSERT": true, "UPDATE": true, "DELETE": true,
+	"CREATE": true, "ALTER": true, "DROP": true, "TRUNCATE": true,
+	"FUNC": true, "FUNCTION": true, "DEF": true, "FN": true,
+	"PACKAGE": true, "CLASS": true, "STRUCT": true, "ENUM": true,
+	"TRAIT": true, "IMPL": true, "TYPEDEF": true, "NAMESPACE": true,
+	"CONST": true, "LET": true, "VAR": true,
+	"PUBLIC": true, "PRIVATE": true, "PROTECTED": true, "READONLY": true,
+	"ASYNC": true, "AWAIT": true, "DEFER": true,
+	"#INCLUDE": true, "#DEFINE": true, "#IFDEF": true, "#IFNDEF": true,
 }
 
-// ─── 词法边界 ───────────────────────────────────────────────────
+// embeddedKW 可能嵌入在单词中的关键词（需要前缀验证）
+var embeddedKW = []string{
+	"FUNCTION", "FUNC(", "FUNC ",
+	"SELECT ", "INSERT ", "UPDATE ", "DELETE ", "CREATE ",
+	"PACKAGE ", "IMPORT ", "CLASS ", "STRUCT ", "ENUM ",
+	"DEF ", "FN ", "CONST ", "LET ", "VAR ", "TYPE ",
+}
 
-// detectCodeKeywordBoundary 检测无标点分隔的代码关键词转换
-func detectCodeKeywordBoundary(line string, segType SegmentType, threshold int) []segmentFragment {
-	if segType != SegmentCode && segType != SegmentPrompt {
-		return nil
-	}
-
+func detectKeywordBoundary(line string, segTyp SegmentType, th int) []fragment {
 	words := strings.Fields(line)
 	if len(words) < 2 {
 		return nil
 	}
 
-	// 从第二个词开始扫描，寻找代码关键词转换点
 	for i := 1; i < len(words); i++ {
-		word := words[i]
-		upperWord := strings.ToUpper(word)
+		w := words[i]
+		wUp := strings.ToUpper(w)
 
-		if len(word) < 2 {
+		if len(w) < 2 {
 			continue
 		}
 
-		// 场景1：独立代码关键词
-		if isUnambiguousCodeKeyword(upperWord) || isStrongLogStartWord(upperWord) {
+		if unambiguousCodeKW[wUp] || isStrongLogStart(wUp) {
 			prefix := strings.TrimSpace(strings.Join(words[:i], " "))
 			suffix := strings.TrimSpace(strings.Join(words[i:], " "))
-
-			if len(prefix) < minPrefixLen || len(suffix) < minSuffixLen {
+			if len(prefix) < minPrefix || len(suffix) < minSuffix {
 				continue
 			}
-
-			prefixCL := classifyLine(prefix)
-			if prefixCL.codeScore >= threshold || prefixCL.logScore >= threshold {
+			pcl := classifyLine(prefix)
+			if pcl.codeScore >= th || pcl.logScore >= th {
 				continue
 			}
-
-			suffixCL := classifyLine(suffix)
-			if suffixCL.codeScore >= threshold || suffixCL.logScore >= threshold {
-				scoreGap := suffixCL.codeScore - prefixCL.codeScore
-				if suffixCL.logScore > suffixCL.codeScore {
-					scoreGap = suffixCL.logScore - prefixCL.logScore
+			scl := classifyLine(suffix)
+			if scl.codeScore >= th || scl.logScore >= th {
+				gap := scl.codeScore - pcl.codeScore
+				if scl.logScore > scl.codeScore {
+					gap = scl.logScore - pcl.logScore
 				}
-				if scoreGap >= threshold/2 {
-					suffixType := SegmentCode
-					if suffixCL.logScore > suffixCL.codeScore {
-						suffixType = SegmentLog
+				if gap >= th/2 {
+					typ := SegmentCode
+					if scl.logScore > scl.codeScore {
+						typ = SegmentLog
 					}
-					return []segmentFragment{
-						{content: prefix, segType: SegmentPrompt},
-						{content: suffix, segType: suffixType},
-					}
+					return []fragment{{content: prefix, typ: SegmentPrompt}, {content: suffix, typ: typ}}
 				}
 			}
 		}
 
-		// 场景2：单词内嵌代码关键词
-		if len(word) > 5 {
-			embeddedIdx := findEmbeddedKeyword(word)
-			if embeddedIdx > 1 {
-				prefixWords := strings.Join(words[:i], " ")
-				prefixPart := word[:embeddedIdx]
-				fullPrefix := strings.TrimSpace(prefixWords + " " + prefixPart)
-
-				codePart := word[embeddedIdx:]
-				restWords := strings.Join(words[i+1:], " ")
-				fullSuffix := strings.TrimSpace(codePart + " " + restWords)
-
-				if len(fullPrefix) >= minPrefixLen && len(fullSuffix) >= minSuffixLen {
-					prefixCL := classifyLine(fullPrefix)
-					suffixCL := classifyLine(fullSuffix)
-
-					if prefixCL.codeScore < threshold && prefixCL.logScore < threshold &&
-						(suffixCL.codeScore >= threshold || suffixCL.logScore >= threshold) {
-						suffixType := SegmentCode
-						if suffixCL.logScore > suffixCL.codeScore {
-							suffixType = SegmentLog
+		// 单词内嵌关键词（如 "errfunc" → "err" + "func"）
+		if len(w) > 5 {
+			if embIdx := findEmbedded(w); embIdx > 1 {
+				prefWords := strings.Join(words[:i], " ")
+				fullPrefix := strings.TrimSpace(prefWords + " " + w[:embIdx])
+				fullSuffix := strings.TrimSpace(w[embIdx:] + " " + strings.Join(words[i+1:], " "))
+				if len(fullPrefix) >= minPrefix && len(fullSuffix) >= minSuffix {
+					pcl := classifyLine(fullPrefix)
+					scl := classifyLine(fullSuffix)
+					if pcl.codeScore < th && pcl.logScore < th &&
+						(scl.codeScore >= th || scl.logScore >= th) {
+						typ := SegmentCode
+						if scl.logScore > scl.codeScore {
+							typ = SegmentLog
 						}
-						return []segmentFragment{
-							{content: fullPrefix, segType: SegmentPrompt},
-							{content: fullSuffix, segType: suffixType},
-						}
+						return []fragment{{content: fullPrefix, typ: SegmentPrompt}, {content: fullSuffix, typ: typ}}
 					}
 				}
 			}
 		}
 	}
-
 	return nil
 }
 
-// isUnambiguousCodeKeyword 检查单词是否为无歧义的代码关键词
-func isUnambiguousCodeKeyword(word string) bool {
-	unambiguous := map[string]bool{
-		"SELECT": true, "INSERT": true, "UPDATE": true, "DELETE": true,
-		"CREATE": true, "ALTER": true, "DROP": true, "TRUNCATE": true,
-		"FUNC": true, "FUNCTION": true, "DEF": true, "FN": true,
-		"PACKAGE": true, "CLASS": true, "STRUCT": true, "ENUM": true,
-		"TRAIT": true, "IMPL": true, "TYPEDEF": true, "NAMESPACE": true,
-		"CONST": true, "LET": true, "VAR": true,
-		"PUBLIC": true, "PRIVATE": true, "PROTECTED": true, "READONLY": true,
-		"ASYNC": true, "AWAIT": true,
-		"DEFER": true,
-		"#INCLUDE": true, "#DEFINE": true, "#IFDEF": true, "#IFNDEF": true,
-	}
-	return unambiguous[word]
-}
-
-// embeddedKeywords 可能在单词内部出现的代码关键词
-var embeddedKeywords = []string{
-	"FUNCTION", "FUNC ", "FUNC(",
-	"SELECT ", "INSERT ", "UPDATE ", "DELETE ", "CREATE ",
-	"PACKAGE ", "IMPORT ", "CLASS ", "STRUCT ", "ENUM ",
-	"DEF ", "FN ", "CONST ", "LET ", "VAR ", "TYPE ",
-	"ERROR:", "PANIC:", "FATAL:",
-}
-
-// findEmbeddedKeyword 在单词中查找嵌入的代码关键词
-func findEmbeddedKeyword(word string) int {
-	upper := strings.ToUpper(word)
-	for _, kw := range embeddedKeywords {
-		idx := strings.Index(upper, kw)
-		if idx > 0 && idx < len(upper)-2 {
+func findEmbedded(word string) int {
+	up := strings.ToUpper(word)
+	for _, kw := range embeddedKW {
+		idx := strings.Index(up, kw)
+		if idx > 0 {
 			return idx
 		}
 	}
-	// 特别处理 "func" 独立出现
-	idx := strings.Index(upper, "FUNC")
-	if idx > 0 {
+	// 特殊处理 "func" 边界（func 后接空格/括号/结尾）
+	if idx := strings.Index(up, "FUNC"); idx > 0 {
 		after := idx + 4
-		if after >= len(upper) || upper[after] == ' ' || upper[after] == '(' || upper[after] == '\t' {
+		if after >= len(up) || up[after] == ' ' || up[after] == '(' {
 			return idx
 		}
 	}
 	return -1
 }
 
-// splitLogAtChineseBoundary 在行首中文与后续日志内容之间分割
-func splitLogAtChineseBoundary(line string, threshold int) []segmentFragment {
+// ─── 行首中文 + 日志内容分割 ──────────────────────────────────────────────────
+
+func splitLogAtChinese(line string, th int) []fragment {
 	runes := []rune(line)
-	// 找到第一个非中文字符的位置
+	// 找第一个非汉字非空格字符
 	firstNonHan := -1
 	for i, r := range runes {
 		if !unicode.Is(unicode.Han, r) && !unicode.IsSpace(r) {
@@ -607,111 +511,77 @@ func splitLogAtChineseBoundary(line string, threshold int) []segmentFragment {
 	if firstNonHan <= 0 || firstNonHan >= len(runes)-1 {
 		return nil
 	}
-
 	// 跳过空白
-	contentStart := firstNonHan
-	for contentStart < len(runes) && (runes[contentStart] == ' ' || runes[contentStart] == '\t') {
-		contentStart++
+	start := firstNonHan
+	for start < len(runes) && (runes[start] == ' ' || runes[start] == '\t') {
+		start++
 	}
-	if contentStart >= len(runes) {
+	if start >= len(runes) {
 		return nil
 	}
-
-	// 检查后续内容是否以日志特征开头（年份数字或 [ 或 Error:）
-	suffixRune := runes[contentStart]
-	suffixByte := line[contentStart]
-	isLogStart := false
-	if suffixRune >= '0' && suffixRune <= '9' && contentStart+3 < len(runes) {
-		// 可能是年份：4位数字开头
-		if runes[contentStart+1] >= '0' && runes[contentStart+1] <= '9' &&
-			runes[contentStart+2] >= '0' && runes[contentStart+2] <= '9' &&
-			runes[contentStart+3] >= '0' && runes[contentStart+3] <= '9' {
-			isLogStart = true
-		}
-	}
-	if suffixByte == '[' || suffixByte == '(' {
-		isLogStart = true
-	}
-	if !isLogStart {
+	// 后续内容须以日志特征开头（年份数字/[/( 等）
+	r0 := runes[start]
+	if !((r0 >= '0' && r0 <= '9' && start+3 < len(runes) &&
+		runes[start+1] >= '0' && runes[start+1] <= '9' &&
+		runes[start+2] >= '0' && runes[start+2] <= '9' &&
+		runes[start+3] >= '0' && runes[start+3] <= '9') ||
+		r0 == '[' || r0 == '(') {
 		return nil
 	}
-
-	// 验证前缀确实是自然语言（非 log/代码）
 	prefix := strings.TrimSpace(string(runes[:firstNonHan]))
-	if len(prefix) < minPrefixLen {
+	suffix := strings.TrimSpace(string(runes[start:]))
+	if len(prefix) < minPrefix || len(suffix) < minSuffix {
 		return nil
 	}
-	prefixCL := classifyLine(prefix)
-	if prefixCL.logScore >= threshold || prefixCL.codeScore >= threshold {
+	pcl := classifyLine(prefix)
+	if pcl.logScore >= th || pcl.codeScore >= th {
 		return nil
 	}
-
-	// 验证后缀确实是 log
-	suffix := strings.TrimSpace(string(runes[contentStart:]))
-	if len(suffix) < minSuffixLen {
+	scl := classifyLine(suffix)
+	if scl.logScore < th {
 		return nil
 	}
-	suffixCL := classifyLine(suffix)
-	if suffixCL.logScore < threshold {
-		return nil
-	}
-
-	return []segmentFragment{
-		{content: prefix, segType: SegmentPrompt},
-		{content: suffix, segType: SegmentLog},
-	}
+	return []fragment{{content: prefix, typ: SegmentPrompt}, {content: suffix, typ: SegmentLog}}
 }
 
-// ─── 辅助函数 ───────────────────────────────────────────────────
+// ─── 构建分割结果 ─────────────────────────────────────────────────────────────
 
-// buildSplitSegments 根据分割结果构建新的 segment 列表
-func buildSplitSegments(orig Segment, lines []string, splitLineIdx int, fragments []segmentFragment) []Segment {
+func buildSplit(orig Segment, lines []string, splitIdx int, frags []fragment) []Segment {
 	var result []Segment
 
-	// 分割行之前的所有行
-	if splitLineIdx > 0 {
-		beforeContent := strings.Join(lines[:splitLineIdx], "\n")
-		if strings.TrimSpace(beforeContent) != "" {
-			// 单个 fragment = 整行重分类（如 log→prompt），前面的行保持原类型
-			// 多个 fragment = 行内分割，前面的行用首个 fragment 类型
-			beforeType := fragments[0].segType
-			if len(fragments) == 1 {
-				beforeType = orig.Type
-			}
-			result = append(result, NewSegment(beforeType, beforeContent))
+	if splitIdx > 0 {
+		before := strings.Join(lines[:splitIdx], "\n")
+		if strings.TrimSpace(before) != "" {
+			result = append(result, NewSegment(orig.Type, before))
 		}
 	}
 
-	// 分割行本身
-	for _, frag := range fragments {
-		trimmed := strings.TrimSpace(frag.content)
-		if trimmed != "" {
-			result = append(result, NewSegment(frag.segType, trimmed))
+	for _, f := range frags {
+		if strings.TrimSpace(f.content) != "" {
+			result = append(result, NewSegment(f.typ, strings.TrimSpace(f.content)))
 		}
 	}
 
-	// 分割行之后的所有行 → 归入最后一个 fragment 的类型
-	if splitLineIdx+1 < len(lines) {
-		afterContent := strings.Join(lines[splitLineIdx+1:], "\n")
-		if strings.TrimSpace(afterContent) != "" {
-			lastType := fragments[len(fragments)-1].segType
-			result = append(result, NewSegment(lastType, afterContent))
+	if splitIdx+1 < len(lines) {
+		after := strings.Join(lines[splitIdx+1:], "\n")
+		if strings.TrimSpace(after) != "" {
+			lastTyp := frags[len(frags)-1].typ
+			result = append(result, NewSegment(lastTyp, after))
 		}
 	}
 
 	if len(result) == 0 {
 		return []Segment{orig}
 	}
-
 	return result
 }
 
-// isWordBoundary 检查 rune 是否为词边界
+// ─── 辅助 ─────────────────────────────────────────────────────────────────────
+
 func isWordBoundary(r rune) bool {
 	return unicode.IsSpace(r) || unicode.IsPunct(r) || unicode.IsSymbol(r)
 }
 
-// isDigit 检查 rune 是否为数字
 func isDigit(r rune) bool {
 	return r >= '0' && r <= '9'
 }
